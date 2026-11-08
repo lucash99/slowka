@@ -113,6 +113,13 @@ input[type=number]{max-width:120px}
   transition:opacity .18s,transform .18s;pointer-events:none;z-index:10;text-align:center}
 #toast.show{opacity:1;transform:none}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
+[hidden]{display:none!important}
+.context{margin:0 0 8px;text-align:center;color:var(--muted);overflow-wrap:anywhere}
+.senses{display:grid;gap:6px}
+.senses button{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:9px 12px;text-align:left;font-size:.95rem}
+.senses button[aria-pressed=true]{border-color:var(--accent);background:var(--soft)}
+.senses small{display:block;color:var(--muted);font-size:.86rem;font-style:italic;margin-top:2px}
+.chips button:disabled{opacity:.55;text-decoration:line-through;cursor:default}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 </style>
 </head>

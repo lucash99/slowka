@@ -163,7 +163,9 @@
   const today = (t = now()) => dayNumber(t, DAY_ROLLOVER);
   const norm = (s) => s.trim().toLowerCase().replace(/\s+/g, ' ');
   const liveNotes = () => Object.values(db.notes).filter((n) => !n.deleted);
-  const findNote = (word) => liveNotes().find((n) => norm(n.word) === norm(word));
+  const sameWord = (word, exceptId) => liveNotes().filter((n) => norm(n.word) === norm(word) && n.id !== exceptId);
+  const splitTranslation = (s) => s.split(',').map(norm).filter(Boolean);
+  const sameTranslation = (a, b) => splitTranslation(a).sort().join('|') === splitTranslation(b).sort().join('|');
 
   function liveCards() {
     return Object.values(db.cards).filter((c) => !c.deleted && db.notes[c.noteId] && !db.notes[c.noteId].deleted);
@@ -208,20 +210,22 @@
     const sep = db.settings.separateDirections;
     const newDone = db.revlog.filter((r) => r.wasNew && !r.undone && today(r.ts) === day).length;
 
-    // Żeby druga strona tego samego słowa nie była podpowiedzią, odkładamy ją na następny dzień.
+    // Żeby inny kierunek lub inne znaczenie tego samego słowa nie były podpowiedzią,
+    // odkładamy je na następny dzień.
+    const wordOf = (c) => norm(db.notes[c.noteId].word);
     const blocked = new Set();
     if (sep) {
       for (const c of cards) {
         const learning = c.state === State.LEARNING || c.state === State.RELEARNING;
-        if (learning || (c.last && today(c.last) === day)) blocked.add(c.noteId);
+        if (learning || (c.last && today(c.last) === day)) blocked.add(wordOf(c));
       }
     }
     const pick = (list, limit) => {
       const out = [];
       for (const c of list) {
         if (out.length >= limit) break;
-        if (sep && blocked.has(c.noteId)) continue;
-        if (sep) blocked.add(c.noteId);
+        if (sep && blocked.has(wordOf(c))) continue;
+        if (sep) blocked.add(wordOf(c));
         out.push(c);
       }
       return out;
@@ -569,6 +573,35 @@
     { g: 4, label: 'Łatwe', color: 'var(--easy)' },
   ];
 
+  /** Zasłania słowo w zdaniu, także w odmienionej formie (come along, came along, coming along). */
+  function maskWord(sentence, word) {
+    const tokens = norm(word).split(' ').map((t) => t.replace(/[^a-z'-]/g, '')).filter(Boolean);
+    if (!tokens.length) return null;
+    const stem = tokens[0].length > 2 ? tokens[0].replace(/e$/, '') : tokens[0];
+    const rest = tokens.slice(1).map((t) => '\\s+' + t).join('');
+    for (const first of [stem, stem.replace(/[aeiouy]+/g, '[aeiouy]+')]) {
+      const re = new RegExp('\\b' + first + '\\w*' + rest + '\\b', 'i');
+      if (re.test(sentence)) return sentence.replace(re, '_____');
+    }
+    return null;
+  }
+
+  /** Tekst pod pytaniem, który wskazuje, o które znaczenie chodzi. Zwraca null, gdy nie jest potrzebny. */
+  function cardContext(note, enFirst) {
+    const others = liveNotes().filter((n) => n.id !== note.id);
+    const otherMeanings = others.some((n) => norm(n.word) === norm(note.word));
+    if (enFirst) {
+      return otherMeanings ? (note.example || note.definition || 'Jedno z kilku znaczeń tego słowa') : null;
+    }
+    const mine = new Set(splitTranslation(note.translation));
+    const sharedTranslation = others.some((n) => splitTranslation(n.translation).some((p) => mine.has(p)));
+    if (!otherMeanings && !sharedTranslation) return null;
+    // Przykładu bez zasłoniętego słowa nie pokazujemy, bo zdradzałby odpowiedź.
+    const masked = note.example && maskWord(note.example, note.word);
+    if (masked) return masked;
+    return note.definition ? (maskWord(note.definition, note.word) || note.definition) : null;
+  }
+
   function renderStudy() {
     const t = now();
     const q = buildQueue(t);
@@ -612,17 +645,20 @@
       ? el('div', { class: 'prompt' }, el('span', { class: 'display' }, note.word), speakButton(note.word))
       : el('div', { class: 'prompt' }, el('span', { class: 'display' }, note.translation));
 
+    const context = cardContext(note, enFirst);
+
     const flash = el('div', { class: 'flash' },
       el('div', { class: 'dir' }, enFirst ? 'ANGIELSKI → POLSKI' : 'POLSKI → ANGIELSKI'),
       front,
+      context && el('p', { class: 'context' }, context),
       !enFirst && !session.revealed && note.pos && el('p', { class: 'meta center' }, note.pos),
       session.revealed && el('div', { class: 'answer' },
         el('div', { class: 'main' },
           el('span', {}, enFirst ? note.translation : note.word),
           !enFirst && speakButton(note.word)),
         note.pos && el('p', { class: 'meta' }, note.pos),
-        note.definition && el('p', { class: 'meta' }, note.definition),
-        note.example && el('p', { class: 'meta example' }, note.example),
+        note.definition && note.definition !== context && el('p', { class: 'meta' }, note.definition),
+        note.example && note.example !== context && el('p', { class: 'meta example' }, note.example),
       ),
     );
 
@@ -753,20 +789,21 @@
     return doc.body.textContent.replace(/\s+/g, ' ').trim();
   }
 
-  /** Część mowy, definicja i przykład z Wiktionary. */
-  async function lookupDefinition(word, signal) {
+  /** Znaczenia z Wiktionary: część mowy, definicja i przykład każdego z nich. */
+  async function lookupSenses(word, signal) {
     const title = encodeURIComponent(norm(word).replace(/ /g, '_'));
     const data = await fetchJson('https://en.wiktionary.org/api/rest_v1/page/definition/' + title, signal);
+    const senses = [];
     for (const entry of Array.isArray(data.en) ? data.en : []) {
       for (const d of Array.isArray(entry.definitions) ? entry.definitions : []) {
         const definition = stripHtml(text(d.definition));
-        if (!definition) continue;
-        const ex = Array.isArray(d.parsedExamples) && d.parsedExamples[0] ? stripHtml(text(d.parsedExamples[0].example)) : '';
+        if (!definition || /^(\w+ )*(spelling|form) of /i.test(definition)) continue;
+        const example = Array.isArray(d.parsedExamples) && d.parsedExamples[0] ? stripHtml(text(d.parsedExamples[0].example)) : '';
         const pos = text(entry.partOfSpeech).toLowerCase();
-        return { pos: POS_PL[pos] || pos, definition, example: ex };
+        senses.push({ pos: POS_PL[pos] || pos, definition, example });
       }
     }
-    return null;
+    return senses.slice(0, 8);
   }
 
   /* ---------- Widok: dodawanie i edycja ---------- */
@@ -784,6 +821,10 @@
 
     const chips = el('div', { class: 'chips', role: 'group', 'aria-label': 'Propozycje tłumaczeń' });
     const status = el('p', { class: 'hint', role: 'status' });
+    const senses = el('div', { class: 'senses', role: 'group', 'aria-label': 'Znaczenia z Wiktionary' });
+    const sensesBox = el('div', { hidden: true, style: 'margin-bottom:14px' },
+      el('p', { class: 'hint', style: 'margin:0 0 6px' }, 'Wybierz definicję i przykład pasujące do tłumaczenia:'), senses);
+    const savedHint = el('p', { class: 'hint', hidden: true });
     const cambridge = el('a', { target: '_blank', rel: 'noopener noreferrer' }, 'Sprawdź w Cambridge');
     const cambridgeHint = el('p', { class: 'hint' }, cambridge);
 
@@ -808,6 +849,83 @@
 
     let lookupRun = 0;
     let controller = null;
+    let foundTranslations = [];
+    let foundSenses = [];
+    let foundInDictionary = false;
+
+    const savedMeanings = () => sameWord(word.value, note && note.id);
+    const usedTranslations = () => new Set(savedMeanings().flatMap((n) => splitTranslation(n.translation)));
+
+    const another = !note && el('button', {
+      class: 'secondary', type: 'button', hidden: true, onclick: () => save(true),
+    }, 'Dodaj i kolejne znaczenie');
+
+    function paintSenses() {
+      const current = definition.value.trim();
+      for (const b of senses.children) b.setAttribute('aria-pressed', String(b.dataset.definition === current));
+    }
+    definition.addEventListener('input', paintSenses);
+
+    function pickSense(sense) {
+      definition.value = sense.definition;
+      example.value = sense.example;
+      pos.value = sense.pos;
+      paintSenses();
+    }
+
+    function renderSuggestions() {
+      const used = usedTranslations();
+      chips.replaceChildren(...foundTranslations.map((value) => {
+        const isUsed = used.has(norm(value));
+        return el('button', {
+          type: 'button', 'data-value': value, 'aria-pressed': 'false', disabled: isUsed,
+          title: isUsed ? 'To znaczenie już masz' : null,
+          onclick: () => {
+            const cur = parts();
+            translation.value = (cur.includes(value) ? cur.filter((x) => x !== value) : [...cur, value]).join(', ');
+            paintChips();
+          },
+        }, value);
+      }));
+      senses.replaceChildren(...foundSenses.map((sense) =>
+        el('button', { type: 'button', 'data-definition': sense.definition, 'aria-pressed': 'false', onclick: () => pickSense(sense) },
+          sense.definition, sense.example && el('small', {}, sense.example))));
+      sensesBox.hidden = foundSenses.length < 2;
+      if (another) another.hidden = foundTranslations.length < 2 && foundSenses.length < 2;
+      paintChips();
+      paintSenses();
+    }
+
+    /** Wypełnia puste pola pierwszą propozycją, której jeszcze nie ma w zapisanych znaczeniach. */
+    function fillEmptyFields() {
+      if (foundInDictionary && !translation.value.trim()) {
+        const used = usedTranslations();
+        const next = foundTranslations.find((v) => !used.has(norm(v)));
+        if (next) translation.value = next;
+      }
+      if (!definition.value && !example.value) {
+        const usedDefinitions = new Set(savedMeanings().map((n) => n.definition));
+        const next = foundSenses.find((s) => !usedDefinitions.has(s.definition));
+        if (next) pickSense(next);
+      }
+      paintChips();
+    }
+
+    function clearSuggestions() {
+      foundTranslations = [];
+      foundSenses = [];
+      foundInDictionary = false;
+      renderSuggestions();
+    }
+
+    function syncSaved() {
+      const saved = word.value.trim() ? savedMeanings() : [];
+      savedHint.hidden = !saved.length;
+      savedHint.textContent = saved.length
+        ? 'Masz już to słowo: ' + saved.map((n) => n.translation).join(' · ') + '. Możesz dodać kolejne znaczenie.'
+        : '';
+    }
+    syncSaved();
 
     async function lookup() {
       const w = word.value.trim();
@@ -822,31 +940,19 @@
       const { signal } = current;
       const timer = setTimeout(() => current.abort(), 10000);
       setStatus('Szukam…');
-      chips.replaceChildren();
-      const [tr, def] = await Promise.allSettled([lookupTranslations(w, signal), lookupDefinition(w, signal)]);
+      clearSuggestions();
+      const [tr, def] = await Promise.allSettled([lookupTranslations(w, signal), lookupSenses(w, signal)]);
       clearTimeout(timer);
       if (run !== lookupRun) return;
 
       const found = tr.status === 'fulfilled' ? tr.value.items : [];
       const dictionary = tr.status === 'fulfilled' && tr.value.dictionary;
+      foundTranslations = found;
+      foundSenses = def.status === 'fulfilled' ? def.value : [];
+      foundInDictionary = dictionary;
+      renderSuggestions();
+      fillEmptyFields();
       if (dictionary && tr.value.pos && !pos.value) pos.value = tr.value.pos;
-      chips.replaceChildren(...found.map((value) =>
-        el('button', {
-          type: 'button', 'data-value': value, 'aria-pressed': 'false',
-          onclick: () => {
-            const cur = parts();
-            translation.value = (cur.includes(value) ? cur.filter((x) => x !== value) : [...cur, value]).join(', ');
-            paintChips();
-          },
-        }, value)));
-      if (dictionary && !translation.value.trim()) translation.value = found[0];
-      paintChips();
-
-      if (def.status === 'fulfilled' && def.value) {
-        if (!pos.value) pos.value = def.value.pos;
-        if (!definition.value) definition.value = def.value.definition;
-        if (!example.value) example.value = def.value.example;
-      }
 
       if (dictionary) setStatus('Dotknij propozycji, żeby ją dodać lub usunąć. Tłumaczenia: Wikisłownik, definicje: Wiktionary.');
       else if (found.length) setStatus('Wikisłownik nie zna tego słowa. Te propozycje z MyMemory mogą być błędne, wybierz właściwą albo wpisz własną.');
@@ -857,10 +963,10 @@
 
     word.addEventListener('input', () => {
       syncCambridge();
-      if (!note) {
-        const dup = word.value.trim() && findNote(word.value);
-        setStatus(dup ? 'To słowo już jest na liście: ' + dup.translation : '', !!dup);
-      }
+      syncSaved();
+      setStatus('');
+      lookupRun++;
+      clearSuggestions();
     });
     word.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
@@ -872,14 +978,23 @@
     function reset() {
       lookupRun++;
       word.value = translation.value = pos.value = definition.value = example.value = '';
-      chips.replaceChildren();
+      clearSuggestions();
       setStatus('');
       syncCambridge();
+      syncSaved();
       word.focus();
     }
 
-    function submit(e) {
-      e.preventDefault();
+    function prepareNextMeaning() {
+      translation.value = pos.value = definition.value = example.value = '';
+      renderSuggestions();
+      fillEmptyFields();
+      syncSaved();
+      setStatus('Dodano. Wybierz kolejne znaczenie.');
+      translation.focus();
+    }
+
+    function save(keepWord) {
       const fields = {
         word: word.value.trim().replace(/\s+/g, ' '),
         translation: parts().join(', '),
@@ -891,9 +1006,8 @@
         setStatus('Podaj słowo i tłumaczenie.', true);
         return;
       }
-      const dup = findNote(fields.word);
-      if (dup && (!note || dup.id !== note.id)) {
-        setStatus('To słowo już jest na liście: ' + dup.translation, true);
+      if (sameWord(fields.word, note && note.id).some((n) => sameTranslation(n.translation, fields.translation))) {
+        setStatus('To znaczenie tego słowa już jest na liście.', true);
         return;
       }
       if (note) {
@@ -903,8 +1017,14 @@
       } else {
         addNote(fields);
         toast('Dodano: ' + fields.word);
-        reset();
+        if (keepWord) prepareNextMeaning();
+        else reset();
       }
+    }
+
+    function submit(e) {
+      e.preventDefault();
+      save(false);
     }
 
     let confirmDelete = false;
@@ -929,14 +1049,17 @@
         el('div', { class: 'row', style: 'margin-top:-10px' }, word,
           el('button', { class: 'secondary', type: 'button', onclick: lookup }, 'Znajdź')),
         cambridgeHint,
+        savedHint,
         el('div', { style: 'height:14px' }),
         el('label', { class: 'field', for: 'f-tr' }, el('span', {}, 'Tłumaczenie')),
         el('div', { style: 'margin-top:-10px;margin-bottom:14px' }, translation, chips, status),
+        sensesBox,
         el('label', { class: 'field' }, el('span', {}, 'Część mowy'), pos),
         el('label', { class: 'field' }, el('span', {}, 'Definicja'), definition),
         el('label', { class: 'field' }, el('span', {}, 'Przykład'), example),
         el('div', { class: 'formbtns' },
           el('button', { class: 'primary', type: 'submit' }, note ? 'Zapisz' : 'Dodaj słówko'),
+          another,
           note && el('button', { class: 'secondary', type: 'button', onclick: () => go('list') }, 'Anuluj'),
           del),
       ),
@@ -1100,7 +1223,7 @@
             type: 'checkbox', checked: s.separateDirections,
             onchange: (e) => changeSetting({ separateDirections: e.target.checked }),
           }),
-          el('span', {}, 'Oba kierunki tego samego słowa w różne dni')),
+          el('span', {}, 'Kierunki i znaczenia tego samego słowa w różne dni')),
       ),
       renderSyncBox(),
       el('section', { class: 'box' },
