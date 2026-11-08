@@ -3,7 +3,6 @@
 
   const { State, schedule, dayNumber, hash, DEFAULTS } = window.FSRS;
   const DAY_ROLLOVER = DEFAULTS.rolloverHour;
-  const LEARN_AHEAD_MS = 20 * 60 * 1000;
 
   /* ---------- Model danych i zapis ----------
    * Każdy rekord ma updatedAt, usunięcia są oznaczane polem deleted, a identyfikatory
@@ -249,11 +248,14 @@
     };
   }
 
-  function nextCard(q, t = now()) {
-    const direct = q.learnDue[0] || q.review[0] || q.fresh[0];
-    if (direct) return direct;
-    const soon = q.later[0];
-    return soon && soon.due - t <= LEARN_AHEAD_MS ? soon : null;
+  const nextCard = (q) => q.learnDue[0] || q.review[0] || q.fresh[0] || null;
+
+  function waitingMessage(later, t) {
+    const n = later.length;
+    const minutes = Math.max(1, Math.ceil((later[0].due - t) / 60000));
+    if (n === 1) return '1 karta wróci za ' + minutes + ' min. Możesz zamknąć apkę, poczeka na następny raz.';
+    const few = n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14);
+    return n + (few ? ' karty wrócą' : ' kart wróci') + ', najbliższa za ' + minutes + ' min. Możesz zamknąć apkę, poczekają na następny raz.';
   }
 
   /* ---------- Synchronizacja przez GitHub ----------
@@ -608,7 +610,7 @@
 
     const current = session.id && db.cards[session.id];
     if (!current || current.deleted) {
-      const next = nextCard(q, t);
+      const next = nextCard(q);
       session = { id: next ? next.id : null, revealed: false };
     }
 
@@ -627,12 +629,9 @@
     }
 
     if (!session.id) {
-      const later = q.later[0];
       return [el('h1', {}, 'Nauka'), counts, el('div', { class: 'empty' },
         el('h2', {}, 'Na teraz koniec'),
-        el('p', {}, later
-          ? 'Kolejna karta wróci za ' + Math.max(1, Math.ceil((later.due - t) / 60000)) + ' min.'
-          : 'Wszystkie zaplanowane karty są przerobione.'),
+        el('p', {}, q.later.length ? waitingMessage(q.later, t) : 'Wszystkie zaplanowane karty są przerobione.'),
         undoState && el('button', { class: 'link', type: 'button', onclick: undo }, 'Cofnij ostatnią odpowiedź'),
       )];
     }
@@ -1288,9 +1287,9 @@
     if (view === 'study' || view === 'list') render();
   });
 
-  // Ekran końcowy ma się sam odświeżyć, gdy karta z kroków nauki znów będzie gotowa.
+  // Ekran końcowy odlicza czas i sam pokazuje kartę, gdy znów będzie gotowa.
   setInterval(() => {
-    if (view === 'study' && !session.id && nextCard(buildQueue())) render();
+    if (view === 'study' && !session.id) render();
   }, 15000);
 
   document.addEventListener('visibilitychange', () => {
