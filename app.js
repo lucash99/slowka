@@ -674,6 +674,8 @@
       .replace(/<ref[\s\S]*?<\/ref>/g, '')
       .replace(/<[^>]+>/g, '')
       .replace(/\{\{[^{}]*\}\}/g, '')
+      .replace(/'''[^']*'''\s*→/g, '') // wpisy typu: '''come along!''' → dalej!
+      .replace(/'''/g, '')
       .replace(/''[^']*''/g, '')
       .replace(/\[\[[^\]|]*\|([^\]]*)\]\]/g, '$1')
       .replace(/\[\[([^\]]*)\]\]/g, '$1')
